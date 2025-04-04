@@ -1,0 +1,208 @@
+/***************************** Include Files *********************************/
+#include <stdio.h>
+#include "platform.h"
+#include "xil_printf.h"
+#include "xparameters.h"     // Defines hardware parameters (MUST BE INCLUDED and UP-TO-DATE)
+#include "xaxidma.h"         // AXI DMA driver header
+#include "xaxidma_hw.h"      // AXI DMA hardware definitions (Needed for offsets and masks)
+#include "xil_cache.h"       // For cache operations
+#include "xstatus.h"         // Contains XST_SUCCESS/XST_FAILURE definitions
+
+/************************** Constant Definitions *****************************/
+
+// --- Values Updated from your xparameters.h ---
+// *** CRITICAL VERIFICATION NEEDED: xparameters.h usually defines XPAR_XAXIDMA_0_DEVICE_ID. ***
+// *** Using 0 as a default because it's the only instance, but verify your BSP generation. ***
+#define DMA_DEV_ID          0                           // Assumed Device ID for axi_dma_0
+#define BRAM_BASE_ADDR      XPAR_AXI_BRAM_CTRL_0_BASEADDR // 0x40000000 from xparameters.h
+
+// *** CRITICAL HARDWARE FIX NEEDED: Your Address Editor shows DMA S2MM writing to BRAM! ***
+// *** You MUST remap /axi_dma_0/Data_S2MM to the PS S_AXI_HP0 range in Vivado Address Editor ***
+// *** for this DDR address to work!                                                        ***
+#define DDR_RX_BUFFER_BASE  0x10000000                  // Base address in DDR for storing FFT results (ensure this range is unused AND DMA CAN WRITE HERE)
+
+#define FFT_N_POINTS        1024                        // ***_REPLACE_THIS_*** Number of points your FFT IP is configured for
+#define BYTES_PER_SAMPLE    4                           // ***_REPLACE_THIS_*** Bytes per sample (e.g., 4 for 32-bit complex: 16b Real + 16b Imag)
+// --- End of Updated Values ---
+
+#define TRANSFER_LENGTH     (FFT_N_POINTS * BYTES_PER_SAMPLE) // Total bytes for one FFT frame
+
+// Define combined error mask if specific ALL_ERR_MASK is not found
+// Check your specific xaxidma_hw.h if these individual masks also cause errors
+#ifndef XAXIDMA_IRQ_ALL_ERR_MASK
+#define XAXIDMA_IRQ_ALL_ERR_MASK (XAXIDMA_IRQ_SLVERR_MASK | XAXIDMA_IRQ_DECERR_MASK | XAXIDMA_IRQ_INTERR_MASK)
+#endif
+
+
+/************************** Variable Definitions *****************************/
+XAxiDma AxiDma; // Instance of the XAxiDma driver
+
+// Buffer in DDR memory to store results received from FFT via DMA S2MM
+u8 RxBuffer[TRANSFER_LENGTH];
+
+/************************** Function Prototypes ******************************/
+int InitAxiDma(u16 DeviceId);
+int DoFFTTransfer(XAxiDma *AxiDmaInst, UINTPTR BramAddr, UINTPTR DdrDestAddr, u32 Length);
+
+/************************** Main Function ************************************/
+int main()
+{
+    int Status;
+
+    init_platform(); // Includes cache enable/disable, basic init
+
+    xil_printf("\r\n--- Entering FFT DMA Test --- \r\n");
+
+    // Initialize the AXI DMA driver
+    Status = InitAxiDma(DMA_DEV_ID);
+    if (Status != XST_SUCCESS) {
+        xil_printf("AXI DMA Initialization failed with status %d\r\n", Status);
+        return XST_FAILURE;
+    }
+    xil_printf("AXI DMA Initialized Successfully.\r\n");
+
+    // Perform the BRAM -> FFT -> DDR transfer via DMA
+    xil_printf("Starting BRAM->FFT->DDR transfer...\r\n");
+    Status = DoFFTTransfer(&AxiDma, BRAM_BASE_ADDR, (UINTPTR)RxBuffer, TRANSFER_LENGTH);
+    if (Status != XST_SUCCESS) {
+        xil_printf("FFT DMA Transfer failed with status %d\r\n", Status);
+        return XST_FAILURE;
+    }
+    xil_printf("FFT DMA Transfer completed successfully.\r\n");
+
+    // At this point, the RxBuffer in DDR memory should contain the FFT output data
+    xil_printf("First few FFT output samples (Hex) from %p:\r\n", (void*)RxBuffer);
+    for (int i = 0; i < 8 && i < FFT_N_POINTS; i++) {
+         volatile u32 *RxBuffer32 = (volatile u32 *)RxBuffer;
+         xil_printf("Sample %d: 0x%08lX\r\n", i, (u32)RxBuffer32[i]);
+    }
+
+
+    xil_printf("--- Exiting FFT DMA Test --- \r\n");
+    cleanup_platform();
+    return XST_SUCCESS;
+}
+
+/*****************************************************************************/
+/**
+* Initializes the AXI DMA driver.
+*
+* @param    DeviceId is the unique ID of the AXI DMA core instance.
+* @return   XST_SUCCESS if initialization was successful, XST_FAILURE otherwise.
+******************************************************************************/
+int InitAxiDma(u16 DeviceId)
+{
+    XAxiDma_Config *CfgPtr;
+    int Status;
+
+    // Look up the configuration based on the device ID
+    CfgPtr = XAxiDma_LookupConfig(DeviceId);
+    if (!CfgPtr) {
+        xil_printf("No config found for DMA device ID %d. Check xparameters.h.\r\n", DeviceId);
+        return XST_FAILURE;
+    }
+
+    // Initialize the driver instance
+    Status = XAxiDma_CfgInitialize(&AxiDma, CfgPtr);
+    if (Status != XST_SUCCESS) {
+        xil_printf("DMA Initialization failed %d\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    // --- SG Mode Check ---
+    // Your xparameters.h shows XPAR_AXI_DMA_0_INCLUDE_SG 0x1 (SG is Enabled in HW)
+    // This code uses the Simple DMA API. While it might work, it's a mismatch.
+    // Recommendation: Disable SG Engine in Vivado DMA IP configuration OR use SG API in software.
+    if (XAxiDma_HasSg(&AxiDma)) {
+         xil_printf("WARNING: DMA Instance %d has Scatter Gather enabled in HW, but this code uses Simple API.\r\n", DeviceId);
+        // This check would normally return failure, but commented out to allow attempt:
+        // return XST_FAILURE;
+    }
+
+    // Disable all DMA interrupts (Simple Mode Polling)
+    XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DEVICE_TO_DMA); // S2MM - Recv from PL
+    XAxiDma_IntrDisable(&AxiDma, XAXIDMA_IRQ_ALL_MASK, XAXIDMA_DMA_TO_DEVICE); // MM2S - Send to PL
+
+    /* Reset DMA engine */
+	XAxiDma_Reset(&AxiDma);
+	while (!XAxiDma_ResetIsDone(&AxiDma)) {
+		// Wait for reset to complete
+	}
+
+    return XST_SUCCESS;
+}
+
+
+/*****************************************************************************/
+/**
+* Performs the DMA transfer: BRAM -> FFT (MM2S) and FFT -> DDR (S2MM).
+* Assumes DMA is already initialized.
+*
+* @param    AxiDmaInst is a pointer to the initialized XAxiDma instance.
+* @param    BramAddr is the starting address in BRAM to read from.
+* @param    DdrDestAddr is the starting address in DDR to write results to.
+* @param    Length is the total number of bytes to transfer.
+* @return   XST_SUCCESS if transfer was successful, XST_FAILURE otherwise.
+******************************************************************************/
+int DoFFTTransfer(XAxiDma *AxiDmaInst, UINTPTR BramAddr, UINTPTR DdrDestAddr, u32 Length)
+{
+    int Status;
+    u32 S2MMStatus;
+    u32 MM2SStatus;
+
+    // --- Step 1: Setup Receive Channel (FFT Output -> DDR) FIRST ---
+    // CRITICAL: Ensure DMA S2MM Master is mapped to DDR range in Vivado Address Editor!
+    Xil_DCacheFlushRange(DdrDestAddr, Length);
+
+    Status = XAxiDma_SimpleTransfer(AxiDmaInst, DdrDestAddr, Length, XAXIDMA_DEVICE_TO_DMA);
+    if (Status != XST_SUCCESS) {
+        xil_printf("S2MM SimpleTransfer Configuration Failed with status %d\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    // --- Step 2: Setup Transmit Channel (BRAM -> FFT) ---
+    Status = XAxiDma_SimpleTransfer(AxiDmaInst, BramAddr, Length, XAXIDMA_DMA_TO_DEVICE);
+    if (Status != XST_SUCCESS) {
+        xil_printf("MM2S SimpleTransfer Configuration Failed with status %d\r\n", Status);
+        return XST_FAILURE;
+    }
+
+    // --- Step 3: Wait for Transfers to Complete ---
+    // Wait for S2MM (Receive from FFT) to complete
+    while (XAxiDma_Busy(AxiDmaInst, XAXIDMA_DEVICE_TO_DMA)) { /* Wait */ }
+
+    // Check S2MM status after completion
+    // *** FIX: Read SR using RegBase + standard RX channel offset + SR offset ***
+    // *** Check xaxidma_hw.h for XAXIDMA_RX_OFFSET and XAXIDMA_SR_OFFSET definitions ***
+    S2MMStatus = XAxiDma_ReadReg(AxiDmaInst->RegBase + XAXIDMA_RX_OFFSET, XAXIDMA_SR_OFFSET);
+    if (!(S2MMStatus & XAXIDMA_IRQ_IOC_MASK)) {
+         xil_printf("WARNING: S2MM Transfer finished (Busy=0) but IOC bit not set. Status=0x%08lX. Check TLAST from FFT.\r\n", S2MMStatus);
+    }
+    // *** FIX: Use combined individual error mask as fallback ***
+    if (S2MMStatus & XAXIDMA_IRQ_ALL_ERR_MASK) {
+         xil_printf("S2MM Transfer Error Detected (Status=0x%08lX)\r\n", S2MMStatus);
+         return XST_FAILURE;
+    }
+
+    // Wait for MM2S (Send to FFT) to complete
+    while (XAxiDma_Busy(AxiDmaInst, XAXIDMA_DMA_TO_DEVICE)) { /* Wait */ }
+
+    // Check MM2S status after completion
+    // *** FIX: Read SR using RegBase + standard TX channel offset + SR offset ***
+    // *** Check xaxidma_hw.h for XAXIDMA_TX_OFFSET and XAXIDMA_SR_OFFSET definitions ***
+    MM2SStatus = XAxiDma_ReadReg(AxiDmaInst->RegBase + XAXIDMA_TX_OFFSET, XAXIDMA_SR_OFFSET);
+    if (!(MM2SStatus & XAXIDMA_IRQ_IOC_MASK)) {
+         xil_printf("WARNING: MM2S Transfer finished (Busy=0) but IOC bit not set. Status=0x%08lX.\r\n", MM2SStatus);
+    }
+    // *** FIX: Use combined individual error mask as fallback ***
+    if (MM2SStatus & XAXIDMA_IRQ_ALL_ERR_MASK) {
+         xil_printf("MM2S Transfer Error detected (Status=0x%08lX)\r\n", MM2SStatus);
+         return XST_FAILURE;
+    }
+
+    // --- Step 4: Invalidate Cache for Receive Buffer ---
+    // Ensure the CPU sees the fresh data written by DMA
+    Xil_DCacheInvalidateRange(DdrDestAddr, Length);
+
+    return XST_SUCCESS;
+}
